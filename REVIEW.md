@@ -1,0 +1,32 @@
+﻿# REVIEW.md
+
+Review of the starter `app/main.py`. "Observed" means I ran that input against the starter and saw the result;
+the other examples follow directly from the code.
+
+| # | Where | What is wrong | How you'd notice it | How I fixed it |
+|---|---|---|---|---|
+| 1 | `MongoClient(...)` (line 22) | Not `tz_aware`, and no server selection timeout. | Observed: `GET /attendance` returned `"punch_in":"2026-07-07T03:58:00"`, a time with no zone. With the default 30 s timeout a stopped database hangs every request. | `tz_aware=True` so everything is aware UTC, epoch-ms helpers for the API, `serverSelectionTimeoutMS=5000`. |
+| 2 | Whole file | No indexes at all, not even a unique one. | Concurrent writes can duplicate rows (rows 8 and 14); `explain` on any list or analytics query shows COLLSCAN. | `ensure_indexes()` at startup creates 8 indexes, each in its own try block so one failure cannot skip the others. |
+| 3 | `health()` | Always returns ok, even when MongoDB is down. | Stop the Mongo container and call `/health`: still 200. | Pings MongoDB and returns 503 if that fails. |
+| 4 | `compute_late_minutes` | Uses the punch's own date and clock (naive, server time), not the IST attendance date. Ignores overnight shifts. Truncates to whole minutes before comparing with 10, so 10:01 to 10:59 late counts as 0. | Punch-in 09:40:30 on a 09:30 shift: 630 s is over the grace, expected 10, the starter gives 0. Shift 22:00 to 06:00 punching in at 03:00: expected 300, the starter gives 0. | Computed on IST shift bounds in seconds: late only if more than 600 s, then whole minutes since shift start. |
+| 5 | `compute_work_hours` | `round()` on a float: float error plus banker's rounding. Naive/aware mix. | 09:00:00 to 11:40:30 is 2.675 h. The starter gives 2.67, R8 needs 2.68. | `Decimal(seconds) / 3600` quantized with ROUND_HALF_UP. |
+| 6 | `compute_overtime` | No 30 minute minimum (R3). Builds an aware shift end but `punch_out` from Mongo is naive, so the subtraction raises TypeError. Overnight shift end (next day) not handled. Never called by any endpoint. | Punch-out 18:40 on an 18:30 shift: expected 0, returns 10. A stored punch_out raises TypeError. | Rewritten on IST shift bounds: whole minutes after shift end, counted only if at least 30, overnight aware. Used by punch-out and PATCH. |
+| 7 | `EmployeeIn`, `PunchInIn` | No validation. | Observed: `emp_code` "BAD1" with email "nope" returned 201. Status "BANANA", shift "9am", `joined_on` "tomorrow", `punched_at` in seconds or as the string "1785732359000" are all accepted. | Patterns for emp_code, email and HH:MM, real-date check, shifts must differ, status `Literal`, strict integer epoch ms in a sane range, length limits. All return 422. |
+| 8 | `create_employee` | `find_one` then `insert_one` is a race. `created_at` is `datetime.now()` (naive local time) returned as an ISO string. | Two simultaneous POSTs with the same emp_code can both get 201. Observed: `created_at` was `"2026-10-10T22:53:17.756773"`. | Unique index on `emp_code`, `DuplicateKeyError` mapped to 409. `created_at` is UTC, returned as epoch ms. |
+| 9 | `list_employees` skip | `skip = page * page_size` skips the whole first page. | With more than 20 employees, page 1 starts at the 21st. Observed: invalid `page=0` returned everyone. | `(page - 1) * page_size`. |
+| 10 | `list_employees` total | `count_documents({})` ignores the department filter. | Observed: `?department=Sales` returned an empty list with `total: 8`. | The count uses the same filter as the query. |
+| 11 | `list_employees` params | No sort, so pages can repeat or skip rows. No bounds on `page` and `page_size`. | Observed: `page=0` and `page_size=101` both returned 200. A negative page gives a negative skip. | Sort by `emp_code`. Query bounds (`page >= 1`, `1 <= page_size <= 100`) return 422. |
+| 12 | `punch_in` employee lookup | `emp` is None for an unknown code, then `emp["shift_start"]` raises TypeError, a 500. | POST punch-in with `emp_code` "EMP9999". | 404 before anything else runs. |
+| 13 | `punch_in` time and date | `datetime.fromtimestamp(ms/1000)` is server-local and naive. The date comes from the server clock, not IST (R1). Milliseconds are kept (R1 truncates to seconds). No overnight rule. `if body.punched_at` treats 0 as "not sent". | Server in UTC: a day-shift punch at 03:00 IST on 3 Aug is stored as 2 Aug 21:30 and gets date 2026-08-02. An overnight shift punch at 03:00 must belong to the previous day. | `ms_to_dt()` (aware UTC, whole seconds), `attendance_date()` in IST with the overnight rule, `is None` check, range validation. |
+| 14 | `punch_in` duplicate check | `find_one` then `insert_one` is a race. | Two identical simultaneous punch-ins can both succeed. | Unique `(emp_code, date)` index, `DuplicateKeyError` maps to 409. Tested with 10 threads: one 201, nine 409. |
+| 15 | `punch_in` and `list_attendance` output | Returns `id` (ObjectId string) and raw datetimes. Legacy documents without `half_day`, `history`, late or overtime are returned as stored. | Observed: `GET /attendance` items contained `"id"` and naive datetime strings. | `record_out()` returns exactly the contract fields, times as epoch ms, defaults for missing fields. |
+| 16 | `list_attendance` | Loads every matching document, sorts in Python and slices. Memory and time grow with the collection. `total` is `len(docs)`. | On 100k records every page request reads all of them. | MongoDB does `sort / skip / limit` using indexes. `total` comes from `count_documents`. |
+| 17 | `list_attendance` sort and params | Sorts by date only, so rows with the same date can swap between pages. `status`, `date_from`, `date_to` not validated. `page=0` slices with a negative start. | `GET /attendance?page=0`, `?status=BOGUS`, `?date_from=2026-02-30` all return 200. | Sort by date descending then `emp_code`. `Literal` status, real-date check, `date_from <= date_to`, page bounds. All return 422. |
+
+## Looked at and decided it is fine
+
+- `load_dotenv()` with its default `override=False`: real environment variables already win over `.env`, as required.
+- `MongoClient` connects lazily, so importing the module does not fail when the database is down. `/health` reports it.
+- `IST` as a fixed +05:30 offset is correct, India has no daylight saving time.
+- `doc.pop("_id")` after `insert_one` is needed because PyMongo adds `_id` to the dict.
+- The missing endpoints (punch-out, PATCH, analytics, explain) are TODOs, not defects. They are implemented.
